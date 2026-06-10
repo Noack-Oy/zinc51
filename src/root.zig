@@ -5,6 +5,10 @@ pub const assembler = @import("assembler.zig");
 pub const output = @import("output.zig");
 
 pub const assemble = assembler.assemble;
+pub const assembleOpts = assembler.assembleOpts;
+pub const Options = assembler.Options;
+pub const FileLoader = assembler.FileLoader;
+pub const LoadedFile = assembler.LoadedFile;
 pub const Result = assembler.Result;
 pub const Chunk = assembler.Chunk;
 pub const Error = assembler.Error;

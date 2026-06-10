@@ -8,8 +8,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const Error = struct {
+    file: []const u8,
     line: u32,
     msg: []const u8,
+    /// Statement ordinal, used to report errors in source order.
+    seq: u32 = 0,
 };
 
 pub const Chunk = struct {
@@ -18,11 +21,35 @@ pub const Chunk = struct {
 };
 
 pub const ListEntry = struct {
+    file: []const u8,
     line_no: u32,
     addr: u32,
     bytes: []const u8,
     src: []const u8,
 };
+
+pub const LoadedFile = struct {
+    source: []const u8,
+    /// Name used in error messages and listings (e.g. the resolved path).
+    name: []const u8,
+};
+
+/// Resolves INCLUDE directives. `path` is the operand as written; `from_file`
+/// is the file containing the directive. Returns null if the file cannot be
+/// loaded; both result slices must outlive the assembly (allocate from `arena`).
+pub const FileLoader = struct {
+    ctx: *anyopaque,
+    load: *const fn (ctx: *anyopaque, arena: Allocator, path: []const u8, from_file: []const u8) ?LoadedFile,
+};
+
+pub const Options = struct {
+    /// Name of the top-level source, used in error messages and listings.
+    file_name: []const u8 = "<input>",
+    /// Without a loader, INCLUDE directives are reported as errors.
+    loader: ?FileLoader = null,
+};
+
+const max_include_depth = 16;
 
 pub const Result = struct {
     chunks: []const Chunk,
@@ -37,21 +64,26 @@ pub const Result = struct {
 /// Assemble `source`. All result memory is allocated from `arena`; the caller
 /// frees everything by resetting/deiniting the arena.
 pub fn assemble(arena: Allocator, source: []const u8) Allocator.Error!Result {
+    return assembleOpts(arena, source, .{});
+}
+
+pub fn assembleOpts(arena: Allocator, source: []const u8, opts: Options) Allocator.Error!Result {
     var a = Assembler{
         .arena = arena,
+        .loader = opts.loader,
         .image = try arena.alloc(u8, 0x10000),
         .used = try arena.alloc(bool, 0x10000),
     };
     @memset(a.used, false);
     @memset(a.image, 0);
     try a.definePredefined();
-    try a.parse(source);
+    try a.parseSource(source, opts.file_name, 0);
     try a.pass1();
     try a.pass2();
     // Pass-1 and pass-2 errors interleave; report them in source order.
     std.sort.insertion(Error, a.errors.items, {}, struct {
         fn lessThan(_: void, x: Error, y: Error) bool {
-            return x.line < y.line;
+            return x.seq < y.seq;
         }
     }.lessThan);
     return .{
@@ -85,12 +117,13 @@ const mnemonics = std.static_string_map.StaticStringMap(Mnemonic).initComptime(.
     .{ "DJNZ", .djnz },
 });
 
-const Directive = enum { org, db, dw, ds, end, equ, set, bit, data, idata, xdata, code };
+const Directive = enum { org, db, dw, ds, end, equ, set, bit, data, idata, xdata, code, include };
 
 const directives = std.static_string_map.StaticStringMap(Directive).initComptime(.{
     .{ "ORG", .org },   .{ "DB", .db },       .{ "DW", .dw },     .{ "DS", .ds },
     .{ "END", .end },   .{ "EQU", .equ },     .{ "SET", .set },   .{ "BIT", .bit },
     .{ "DATA", .data }, .{ "IDATA", .idata }, .{ "XDATA", .xdata }, .{ "CODE", .code },
+    .{ "INCLUDE", .include },
 });
 
 fn isSymDefDirective(d: Directive) bool {
@@ -136,6 +169,7 @@ const Stmt = union(enum) {
 };
 
 const SrcLine = struct {
+    file: []const u8,
     no: u32,
     text: []const u8,
     labels: []const []const u8, // uppercased
@@ -159,14 +193,22 @@ const Assembler = struct {
     listing: std.ArrayList(ListEntry) = .empty,
     image: []u8,
     used: []bool,
+    loader: ?FileLoader = null,
     pc: u32 = 0,
     dollar: u32 = 0,
+    cur_file: []const u8 = "",
     cur_line: u32 = 0,
+    cur_seq: u32 = 0,
     overflow_reported: bool = false,
 
     fn errf(a: *Assembler, comptime fmt: []const u8, args: anytype) void {
         const msg = std.fmt.allocPrint(a.arena, fmt, args) catch return;
-        a.errors.append(a.arena, .{ .line = a.cur_line, .msg = msg }) catch {};
+        a.errors.append(a.arena, .{
+            .file = a.cur_file,
+            .line = a.cur_line,
+            .msg = msg,
+            .seq = a.cur_seq,
+        }) catch {};
     }
 
     // ------------------------------------------------------------------
@@ -221,25 +263,64 @@ const Assembler = struct {
     // Parsing
     // ------------------------------------------------------------------
 
-    fn parse(a: *Assembler, source: []const u8) Allocator.Error!void {
+    fn parseSource(a: *Assembler, source: []const u8, file: []const u8, depth: u32) Allocator.Error!void {
         var it = std.mem.splitScalar(u8, source, '\n');
         var no: u32 = 0;
         while (it.next()) |raw| {
             no += 1;
             var line = raw;
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            a.cur_file = file;
             a.cur_line = no;
-            try a.parseLine(line, no);
+            a.cur_seq = @intCast(a.lines.items.len);
+            try a.parseLine(line, no, depth);
         }
     }
 
-    fn parseLine(a: *Assembler, full_text: []const u8, no: u32) Allocator.Error!void {
-        var line = SrcLine{ .no = no, .text = full_text, .labels = &.{}, .stmt = .none };
+    /// Load and splice in an included file. `raw_arg` is the operand as
+    /// written: a bare path or one quoted with '...' or "..." (taken verbatim,
+    /// no escape processing — Windows paths contain backslashes).
+    fn handleInclude(a: *Assembler, raw_arg: []const u8, depth: u32) Allocator.Error!void {
+        var path = std.mem.trim(u8, raw_arg, " \t");
+        if (path.len >= 2 and (path[0] == '"' or path[0] == '\'') and path[path.len - 1] == path[0])
+            path = path[1 .. path.len - 1];
+        if (path.len == 0) {
+            a.errf("INCLUDE requires a file path", .{});
+            return;
+        }
+        if (depth >= max_include_depth) {
+            a.errf("includes nested deeper than {d} levels (circular include?)", .{max_include_depth});
+            return;
+        }
+        const loader = a.loader orelse {
+            a.errf("INCLUDE is not available here (no file loader configured)", .{});
+            return;
+        };
+        const sub = loader.load(loader.ctx, a.arena, path, a.cur_file) orelse {
+            a.errf("cannot open include file '{s}'", .{path});
+            return;
+        };
+        try a.parseSource(sub.source, sub.name, depth + 1);
+    }
+
+    fn parseLine(a: *Assembler, full_text: []const u8, no: u32, depth: u32) Allocator.Error!void {
+        var line = SrcLine{ .file = a.cur_file, .no = no, .text = full_text, .labels = &.{}, .stmt = .none };
         var rest = std.mem.trim(u8, stripComment(full_text), " \t");
 
-        // Assembler control lines ($MOD51, $TITLE, ...) are ignored.
+        // Assembler control lines: $INCLUDE(file) is honored, the rest
+        // ($MOD51, $TITLE, ...) are ignored.
         if (rest.len > 0 and rest[0] == '$') {
             try a.lines.append(a.arena, line);
+            const ctl = rest[1..];
+            const n = identLen(ctl);
+            if (n > 0 and std.ascii.eqlIgnoreCase(ctl[0..n], "INCLUDE")) {
+                const arg = std.mem.trim(u8, ctl[n..], " \t");
+                if (arg.len >= 2 and arg[0] == '(' and arg[arg.len - 1] == ')') {
+                    try a.handleInclude(arg[1 .. arg.len - 1], depth);
+                } else {
+                    a.errf("$INCLUDE expects a parenthesized file name: $INCLUDE(file)", .{});
+                }
+            }
             return;
         }
 
@@ -264,6 +345,13 @@ const Assembler = struct {
             return;
         }
 
+        // Directives may be written with a leading dot (.org, .include, ...).
+        var dotted = false;
+        if (rest[0] == '.') {
+            dotted = true;
+            rest = std.mem.trim(u8, rest[1..], " \t");
+        }
+
         const t1_len = identLen(rest);
         if (t1_len == 0) {
             a.errf("expected instruction or directive", .{});
@@ -271,24 +359,29 @@ const Assembler = struct {
             return;
         }
         const t1 = rest[0..t1_len];
-        var after_t1 = std.mem.trim(u8, rest[t1_len..], " \t");
+        const after_t1 = std.mem.trim(u8, rest[t1_len..], " \t");
 
-        // `name EQU expr` style symbol definitions (second token is the directive).
-        const t2_len = identLen(after_t1);
-        if (t2_len > 0) {
-            var ubuf: [16]u8 = undefined;
-            if (upperTo(&ubuf, after_t1[0..t2_len])) |t2u| {
-                if (directives.get(t2u)) |d| {
-                    if (isSymDefDirective(d)) {
-                        if (line.labels.len > 0)
-                            a.errf("'{s}' takes a plain name, not a label with ':'", .{t2u});
-                        line.stmt = .{ .symdef = .{
-                            .name = try a.upperDup(t1),
-                            .expr = std.mem.trim(u8, after_t1[t2_len..], " \t"),
-                            .redefinable = d == .set,
-                        } };
-                        try a.lines.append(a.arena, line);
-                        return;
+        // `name EQU expr` style symbol definitions (second token is the
+        // directive, optionally dotted).
+        if (!dotted) {
+            var t2src = after_t1;
+            if (t2src.len > 0 and t2src[0] == '.') t2src = std.mem.trim(u8, t2src[1..], " \t");
+            const t2_len = identLen(t2src);
+            if (t2_len > 0) {
+                var ubuf: [16]u8 = undefined;
+                if (upperTo(&ubuf, t2src[0..t2_len])) |t2u| {
+                    if (directives.get(t2u)) |d| {
+                        if (isSymDefDirective(d)) {
+                            if (line.labels.len > 0)
+                                a.errf("'{s}' takes a plain name, not a label with ':'", .{t2u});
+                            line.stmt = .{ .symdef = .{
+                                .name = try a.upperDup(t1),
+                                .expr = std.mem.trim(u8, t2src[t2_len..], " \t"),
+                                .redefinable = d == .set,
+                            } };
+                            try a.lines.append(a.arena, line);
+                            return;
+                        }
                     }
                 }
             }
@@ -308,10 +401,21 @@ const Assembler = struct {
                 .end => line.stmt = .end,
                 .db => line.stmt = .{ .db = try a.parseItems(after_t1) },
                 .dw => line.stmt = .{ .dw = try a.parseItems(after_t1) },
+                .include => {
+                    try a.lines.append(a.arena, line);
+                    try a.handleInclude(after_t1, depth);
+                    return;
+                },
                 .equ, .set, .bit, .data, .idata, .xdata, .code => {
                     a.errf("'{s}' requires a name: NAME {s} expression", .{ t1u, t1u });
                 },
             }
+            try a.lines.append(a.arena, line);
+            return;
+        }
+
+        if (dotted) {
+            a.errf("unknown directive '.{s}'", .{t1});
             try a.lines.append(a.arena, line);
             return;
         }
@@ -435,8 +539,10 @@ const Assembler = struct {
 
     fn pass1(a: *Assembler) Allocator.Error!void {
         a.pc = 0;
-        for (a.lines.items) |*line| {
+        for (a.lines.items, 0..) |*line, idx| {
+            a.cur_file = line.file;
             a.cur_line = line.no;
+            a.cur_seq = @intCast(idx);
             a.dollar = a.pc;
             line.addr = a.pc;
             for (line.labels) |name| a.defineSymbol(name, a.pc, false);
@@ -498,10 +604,18 @@ const Assembler = struct {
 
     fn pass2(a: *Assembler) Allocator.Error!void {
         a.pc = 0;
-        for (a.lines.items) |*line| {
+        for (a.lines.items, 0..) |*line, idx| {
+            a.cur_file = line.file;
             a.cur_line = line.no;
+            a.cur_seq = @intCast(idx);
             a.dollar = a.pc;
-            var entry = ListEntry{ .line_no = line.no, .addr = a.pc, .bytes = &.{}, .src = line.text };
+            var entry = ListEntry{
+                .file = line.file,
+                .line_no = line.no,
+                .addr = a.pc,
+                .bytes = &.{},
+                .src = line.text,
+            };
             switch (line.stmt) {
                 .none => {},
                 .org => {
@@ -1761,6 +1875,112 @@ test "errors" {
     try expectError("  org 0\n  nop\n  org 0\n  nop\n", "overlapping code");
     try expectError("  db 1/0\n", "division by zero");
     try expectError("  db 'unterminated\n", "unterminated");
+}
+
+/// In-memory file system for include tests.
+const TestFs = struct {
+    files: []const [2][]const u8,
+
+    fn load(ctx: *anyopaque, arena: Allocator, path: []const u8, from_file: []const u8) ?LoadedFile {
+        _ = arena;
+        _ = from_file;
+        const self: *TestFs = @ptrCast(@alignCast(ctx));
+        for (self.files) |f| {
+            if (std.mem.eql(u8, f[0], path)) return .{ .source = f[1], .name = f[0] };
+        }
+        return null;
+    }
+
+    fn loader(self: *TestFs) FileLoader {
+        return .{ .ctx = self, .load = TestFs.load };
+    }
+};
+
+test "include splices files and shares symbols" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fs = TestFs{ .files = &.{
+        .{ "defs.inc", "LED bit P1.0\nSTART_VAL equ 42\n" },
+        .{ "util.asm", "blink: cpl LED\n ret\n" },
+    } };
+    const res = try assembleOpts(arena_state.allocator(),
+        \\ .include "defs.inc"
+        \\ mov a, #START_VAL
+        \\ acall blink
+        \\ include util.asm
+    , .{ .file_name = "main.asm", .loader = fs.loader() });
+    for (res.errors) |e| std.debug.print("{s}:{d}: {s}\n", .{ e.file, e.line, e.msg });
+    try testing.expectEqual(@as(usize, 0), res.errors.len);
+    try testing.expectEqual(@as(usize, 1), res.chunks.len);
+    try testing.expectEqualSlices(u8, &.{ 0x74, 0x2A, 0x11, 0x04, 0xB2, 0x90, 0x22 }, res.chunks[0].data);
+}
+
+test "nested includes and the $INCLUDE control form" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fs = TestFs{ .files = &.{
+        .{ "a.inc", " db 1\n .include \"b.inc\"\n db 3\n" },
+        .{ "b.inc", " db 2\n" },
+    } };
+    const res = try assembleOpts(arena_state.allocator(),
+        \\$include(a.inc)
+        \\ db 4
+    , .{ .file_name = "main.asm", .loader = fs.loader() });
+    for (res.errors) |e| std.debug.print("{s}:{d}: {s}\n", .{ e.file, e.line, e.msg });
+    try testing.expectEqual(@as(usize, 0), res.errors.len);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, res.chunks[0].data);
+}
+
+test "errors are attributed to the included file" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fs = TestFs{ .files = &.{
+        .{ "bad.inc", " nop\n mov a, 300h\n" },
+    } };
+    const res = try assembleOpts(arena_state.allocator(), " .include \"bad.inc\"\n", .{
+        .file_name = "main.asm",
+        .loader = fs.loader(),
+    });
+    try testing.expectEqual(@as(usize, 1), res.errors.len);
+    try testing.expectEqualStrings("bad.inc", res.errors[0].file);
+    try testing.expectEqual(@as(u32, 2), res.errors[0].line);
+}
+
+test "include error cases" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var fs = TestFs{ .files = &.{
+        .{ "loop.inc", " .include \"loop.inc\"\n" },
+    } };
+    const res = try assembleOpts(arena_state.allocator(),
+        \\ .include "loop.inc"
+        \\ .include "missing.inc"
+        \\ .include
+    , .{ .file_name = "main.asm", .loader = fs.loader() });
+    var found_circular = false;
+    var found_missing = false;
+    var found_no_path = false;
+    for (res.errors) |e| {
+        if (std.mem.indexOf(u8, e.msg, "circular") != null) found_circular = true;
+        if (std.mem.indexOf(u8, e.msg, "cannot open include file 'missing.inc'") != null) found_missing = true;
+        if (std.mem.indexOf(u8, e.msg, "requires a file path") != null) found_no_path = true;
+    }
+    try testing.expect(found_circular);
+    try testing.expect(found_missing);
+    try testing.expect(found_no_path);
+
+    // Without a loader, INCLUDE is an error rather than silently ignored.
+    try expectError("  .include \"x.inc\"\n", "no file loader");
+}
+
+test "dotted directives" {
+    try expectProgram(
+        \\    .org 10h
+        \\    .db 1, 2
+        \\val .equ 3
+        \\    .db val
+    , 0x10, &.{ 1, 2, 3 });
+    try expectError("  .frobnicate 1\n", "unknown directive");
 }
 
 test "ds leaves gaps and org reorders" {

@@ -69,9 +69,31 @@ page; relative branches verify the −128…+127 range.
 | `DB item, ...` | emit bytes; items are expressions or strings (`'…'` or `"…"`) |
 | `DW item, ...` | emit 16-bit words, high byte first |
 | `DS expr` | reserve space (no bytes emitted) |
+| `INCLUDE file` | textually include another source file |
 | `END` | stop assembling |
 
-Lines starting with `$` (assembler controls such as `$MOD51`) are ignored.
+Every directive may also be written with a leading dot (`.org`, `.include`,
+`name .equ 1`, ...).
+
+Lines starting with `$` (assembler controls such as `$MOD51`) are ignored,
+with one exception: the classic `$INCLUDE(file)` control works and is
+equivalent to `INCLUDE`.
+
+### Includes
+
+```asm
+        .include "at89s52.inc"      ; controller-specific header
+        include  ../common/util.asm ; bare and unquoted forms work too
+```
+
+The path may be bare or quoted (`'…'` or `"…"`); quotes are stripped
+verbatim, with no escape processing, so Windows backslash paths are fine.
+Relative paths are resolved against the directory of the *including* file.
+Includes may nest (16 levels deep — beyond that zinc51 assumes a circular
+include); labels and symbols are shared across all files, and errors are
+reported with the name of the file they occur in. See
+[examples/timer2.asm](examples/timer2.asm), which pulls timer-2 SFR
+definitions from [examples/at89s52.inc](examples/at89s52.inc).
 
 ### Expressions
 
@@ -107,6 +129,12 @@ if (!result.ok()) {
 for (result.chunks) |c| ... // c.addr, c.data
 const hex = try zinc51.output.renderIhex(arena.allocator(), result.chunks);
 ```
+
+The core performs no file I/O of its own. To support `INCLUDE`, pass a
+`FileLoader` (any context + function pair that maps a path to source text)
+via `assembleOpts`; the CLI's loader lives in
+[src/main.zig](src/main.zig) (`DiskLoader`), and the tests use an in-memory
+one (`TestFs` in [src/assembler.zig](src/assembler.zig)).
 
 ## Layout
 

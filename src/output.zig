@@ -54,7 +54,14 @@ pub fn renderBin(arena: Allocator, chunks: []const assembler.Chunk) Allocator.Er
 pub fn renderListing(arena: Allocator, listing: []const assembler.ListEntry) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "ADDR  CODE               LINE  SOURCE\n");
+    var cur_file: ?[]const u8 = null;
     for (listing) |ent| {
+        if (cur_file == null) {
+            cur_file = ent.file;
+        } else if (!std.mem.eql(u8, cur_file.?, ent.file)) {
+            cur_file = ent.file;
+            try appendf(arena, &out, "                         ; ==== {s} ====\n", .{ent.file});
+        }
         const rows = if (ent.bytes.len == 0) 1 else (ent.bytes.len + 5) / 6;
         var r: usize = 0;
         while (r < rows) : (r += 1) {

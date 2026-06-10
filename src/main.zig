@@ -64,9 +64,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
 
-    const res = try zinc51.assemble(arena, src);
+    var loader = DiskLoader{ .io = io };
+    const res = try zinc51.assembleOpts(arena, src, .{
+        .file_name = in_path,
+        .loader = .{ .ctx = &loader, .load = DiskLoader.load },
+    });
     if (res.errors.len != 0) {
-        for (res.errors) |e| std.debug.print("{s}:{d}: error: {s}\n", .{ in_path, e.line, e.msg });
+        for (res.errors) |e| std.debug.print("{s}:{d}: error: {s}\n", .{ e.file, e.line, e.msg });
         std.debug.print("zinc51: {d} error(s), no output written\n", .{res.errors.len});
         return 1;
     }
@@ -93,6 +97,28 @@ pub fn main(init: std.process.Init) !u8 {
     try w.flush();
     return 0;
 }
+
+/// Resolves INCLUDE paths relative to the directory of the including file;
+/// absolute paths are used as-is.
+const DiskLoader = struct {
+    io: std.Io,
+
+    fn load(
+        ctx: *anyopaque,
+        arena: std.mem.Allocator,
+        path: []const u8,
+        from_file: []const u8,
+    ) ?zinc51.LoadedFile {
+        const self: *DiskLoader = @ptrCast(@alignCast(ctx));
+        const resolved = resolve: {
+            if (std.fs.path.isAbsolute(path)) break :resolve path;
+            const dir = std.fs.path.dirname(from_file) orelse break :resolve path;
+            break :resolve std.fs.path.join(arena, &.{ dir, path }) catch return null;
+        };
+        const source = std.Io.Dir.cwd().readFileAlloc(self.io, resolved, arena, .limited(16 << 20)) catch return null;
+        return .{ .source = source, .name = resolved };
+    }
+};
 
 fn writeOut(io: std.Io, path: []const u8, data: []const u8) !void {
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch |err| {
