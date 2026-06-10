@@ -1,0 +1,5 @@
+.zig-cache/
+zig-out/
+examples/*.hex
+examples/*.bin
+examples/*.lst
