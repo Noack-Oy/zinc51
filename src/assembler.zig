@@ -117,18 +117,21 @@ const mnemonics = std.static_string_map.StaticStringMap(Mnemonic).initComptime(.
     .{ "DJNZ", .djnz },
 });
 
-const Directive = enum { org, db, dw, ds, end, equ, set, bit, data, idata, xdata, code, include };
+const Directive = enum { org, db, dw, ds, end, equ, set, bit, flag, data, idata, xdata, code, include };
 
 const directives = std.static_string_map.StaticStringMap(Directive).initComptime(.{
     .{ "ORG", .org },   .{ "DB", .db },       .{ "DW", .dw },     .{ "DS", .ds },
     .{ "END", .end },   .{ "EQU", .equ },     .{ "SET", .set },   .{ "BIT", .bit },
     .{ "DATA", .data }, .{ "IDATA", .idata }, .{ "XDATA", .xdata }, .{ "CODE", .code },
     .{ "INCLUDE", .include },
+    // as31 compatibility: .FLAG defines a bit symbol, .BYTE/.WORD/.SKIP
+    // are aliases of DB/DW/DS.
+    .{ "FLAG", .flag }, .{ "BYTE", .db },     .{ "WORD", .dw },   .{ "SKIP", .ds },
 });
 
 fn isSymDefDirective(d: Directive) bool {
     return switch (d) {
-        .equ, .set, .bit, .data, .idata, .xdata, .code => true,
+        .equ, .set, .bit, .flag, .data, .idata, .xdata, .code => true,
         else => false,
     };
 }
@@ -361,15 +364,20 @@ const Assembler = struct {
         const t1 = rest[0..t1_len];
         const after_t1 = std.mem.trim(u8, rest[t1_len..], " \t");
 
+        var ubuf: [16]u8 = undefined;
+        const maybe_t1u = upperTo(&ubuf, t1);
+        const t1_mn: ?Mnemonic = if (maybe_t1u) |u| mnemonics.get(u) else null;
+
         // `name EQU expr` style symbol definitions (second token is the
-        // directive, optionally dotted).
-        if (!dotted) {
+        // directive, optionally dotted). Mnemonics can never be symbol
+        // names, so `setb flag` stays an instruction.
+        if (!dotted and t1_mn == null) {
             var t2src = after_t1;
             if (t2src.len > 0 and t2src[0] == '.') t2src = std.mem.trim(u8, t2src[1..], " \t");
             const t2_len = identLen(t2src);
             if (t2_len > 0) {
-                var ubuf: [16]u8 = undefined;
-                if (upperTo(&ubuf, t2src[0..t2_len])) |t2u| {
+                var ubuf2: [16]u8 = undefined;
+                if (upperTo(&ubuf2, t2src[0..t2_len])) |t2u| {
                     if (directives.get(t2u)) |d| {
                         if (isSymDefDirective(d)) {
                             if (line.labels.len > 0)
@@ -387,8 +395,7 @@ const Assembler = struct {
             }
         }
 
-        var ubuf: [16]u8 = undefined;
-        const t1u = upperTo(&ubuf, t1) orelse {
+        const t1u = maybe_t1u orelse {
             a.errf("unknown instruction or directive '{s}'", .{t1});
             try a.lines.append(a.arena, line);
             return;
@@ -406,8 +413,19 @@ const Assembler = struct {
                     try a.handleInclude(after_t1, depth);
                     return;
                 },
-                .equ, .set, .bit, .data, .idata, .xdata, .code => {
-                    a.errf("'{s}' requires a name: NAME {s} expression", .{ t1u, t1u });
+                .equ, .set, .bit, .flag, .data, .idata, .xdata, .code => {
+                    // as31-style comma form: .EQU name, expr
+                    const n = identLen(after_t1);
+                    const after_name = std.mem.trim(u8, after_t1[n..], " \t");
+                    if (n > 0 and after_name.len > 1 and after_name[0] == ',') {
+                        line.stmt = .{ .symdef = .{
+                            .name = try a.upperDup(after_t1[0..n]),
+                            .expr = std.mem.trim(u8, after_name[1..], " \t"),
+                            .redefinable = d == .set,
+                        } };
+                    } else {
+                        a.errf("'{s}' requires a name: NAME {s} expr, or {s} name, expr", .{ t1u, t1u, t1u });
+                    }
                 },
             }
             try a.lines.append(a.arena, line);
@@ -420,7 +438,7 @@ const Assembler = struct {
             return;
         }
 
-        if (mnemonics.get(t1u)) |mn| {
+        if (t1_mn) |mn| {
             var ops: std.ArrayList(Operand) = .empty;
             if (after_t1.len > 0) {
                 const parts = try splitTopLevel(a.arena, after_t1);
@@ -1437,7 +1455,9 @@ const Ev = struct {
             if (!ev.match(")")) return ev.fail("missing ')'", .{});
             return v;
         }
-        if (c == '$') {
+        // `$` and `*` (as31 style) are the current statement's address.
+        // In value position `*` is unambiguous; as an operator it multiplies.
+        if (c == '$' or c == '*') {
             ev.i += 1;
             return ev.a.dollar;
         }
@@ -1508,6 +1528,7 @@ fn unescape(c: u8) ?u8 {
         'n' => '\n',
         'r' => '\r',
         't' => '\t',
+        'b' => 8, // backspace, as31 compatibility
         '0' => 0,
         '\\' => '\\',
         '\'' => '\'',
@@ -1983,13 +2004,39 @@ test "dotted directives" {
     try expectError("  .frobnicate 1\n", "unknown directive");
 }
 
+test "as31 compatibility: comma-form equ, flag, byte/word/skip, star" {
+    try expectProgram(
+        \\.equ stack, 0x40
+        \\.flag led, p1.1
+        \\ mov sp, #stack
+        \\ setb led
+        \\loop: sjmp *
+        \\.byte 1, "ab"
+        \\.word 0x1234
+    , 0, &.{
+        0x75, 0x81, 0x40, 0xD2, 0x91, 0x80, 0xFE,
+        0x01, 0x61, 0x62, 0x12, 0x34,
+    });
+}
+
+test "symbols may collide with directive names" {
+    // `flag`/`data` are directives, but a mnemonic in front means the line
+    // is an instruction and the word is an ordinary symbol reference.
+    try expectProgram(
+        \\flag bit p1.0
+        \\data equ 30h
+        \\ setb flag
+        \\ mov data, a
+    , 0, &.{ 0xD2, 0x90, 0xF5, 0x30 });
+}
+
 test "ds leaves gaps and org reorders" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const res = try assemble(arena_state.allocator(),
         \\ org 10h
         \\ nop
-        \\ ds 2
+        \\ .skip 2
         \\ nop
     );
     try testing.expectEqual(@as(usize, 0), res.errors.len);

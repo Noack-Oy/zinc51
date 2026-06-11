@@ -98,8 +98,9 @@ definitions from [examples/at89s52.inc](examples/at89s52.inc).
 ### Expressions
 
 * Numbers: `255`, `0FFh`, `0xFF`, `11111111b`, `0b1010`, `17o`/`17q` (octal),
-  `99d`, character literals `'A'` (escapes: `\n \r \t \0 \\ \' \"`)
-* `$` is the address of the current statement
+  `99d`, character literals `'A'` (escapes: `\n \r \t \b \0 \\ \' \"`)
+* `$` is the address of the current statement (as31-style `*` also works in
+  value position)
 * Operators by precedence: `byte.bit` (bit addressing), unary `- + ~ NOT HIGH
   LOW`, `* / % MOD`, `+ -`, `<< >> SHL SHR`, `& AND`, `^ XOR`, `| OR`,
   parentheses
@@ -112,6 +113,29 @@ definitions from [examples/at89s52.inc](examples/at89s52.inc).
 All standard 8051 SFRs (`P0`–`P3`, `SP`, `DPL`, `DPH`, `PCON`, `TCON`, `TMOD`,
 `TL0/1`, `TH0/1`, `SCON`, `SBUF`, `IE`, `IP`, `PSW`, `ACC`, `B`) and SFR bits
 (`TR0/1`, `TF0/1`, `TI`, `RI`, `EA`, `CY`, `OV`, …) are predefined.
+
+### as31 compatibility
+
+zinc51 assembles [as31](http://www.pjrc.com/tech/8051/) sources unmodified in
+most cases:
+
+* `.EQU name, expr` comma form (likewise for `SET`/`BIT`/`FLAG`/`DATA`/…)
+* `.FLAG` (= `BIT`), `.BYTE` (= `DB`), `.WORD` (= `DW`), `.SKIP` (= `DS`)
+* `*` as the location counter in value position
+* number suffixes/prefixes behave identically (including `0b0h` = `B0h`)
+
+zinc51 is validated byte-for-byte against as31's reference outputs (the
+PAULMON1/PAULMON2 monitors plus the user-command extras, ~15.5 KB of code):
+
+```
+zinc51 ../as31/tests/paulmon1.asm -o paulmon1.hex
+python tools/hexdiff.py ../as31/tests/paulmon1.ref paulmon1.hex
+```
+
+Known differences: zinc51 has no leading-zero octal (as31 reads `0377` as
+octal; zinc51 reads it as decimal — write `377o` or `0xFF`), symbols are
+case-insensitive (as31's are case-sensitive), and `$`-control lines other
+than `$INCLUDE` are ignored rather than interpreted.
 
 ## Library use
 
