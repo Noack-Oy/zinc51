@@ -622,6 +622,18 @@ const Assembler = struct {
 
     fn pass2(a: *Assembler) Allocator.Error!void {
         a.pc = 0;
+        // Forget SET symbols so they can be re-applied in source order:
+        // each use of a SET symbol must see the most recent preceding
+        // definition (not the final one), and a use before the first SET
+        // is an undefined-symbol error, as in classic ASM51.
+        {
+            var stale: std.ArrayList([]const u8) = .empty;
+            var it = a.syms.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.redefinable) try stale.append(a.arena, kv.key_ptr.*);
+            }
+            for (stale.items) |name| _ = a.syms.remove(name);
+        }
         for (a.lines.items, 0..) |*line, idx| {
             a.cur_file = line.file;
             a.cur_line = line.no;
@@ -640,7 +652,17 @@ const Assembler = struct {
                     a.pc = line.val;
                     entry.addr = a.pc;
                 },
-                .symdef => entry.addr = line.val,
+                .symdef => |sd| {
+                    if (sd.redefinable) {
+                        // Re-apply SET positionally; evaluate leniently —
+                        // any errors were already reported by pass 1.
+                        const v = a.evalText(sd.expr, false);
+                        try a.syms.put(a.arena, sd.name, .{ .value = v, .redefinable = true });
+                        entry.addr = @truncate(@as(u64, @bitCast(v)));
+                    } else {
+                        entry.addr = line.val;
+                    }
+                },
                 .ds => a.pc += line.val,
                 .db => |items| {
                     var bytes: std.ArrayList(u8) = .empty;
@@ -2017,6 +2039,18 @@ test "as31 compatibility: comma-form equ, flag, byte/word/skip, star" {
         0x75, 0x81, 0x40, 0xD2, 0x91, 0x80, 0xFE,
         0x01, 0x61, 0x62, 0x12, 0x34,
     });
+}
+
+test "SET symbols are positional" {
+    // Each use sees the most recent preceding SET value, not the final one.
+    try expectProgram(
+        \\cnt set 2
+        \\ mov a, #cnt
+        \\cnt set 5
+        \\ mov a, #cnt
+    , 0, &.{ 0x74, 0x02, 0x74, 0x05 });
+    // Using a SET symbol before its first definition is an error.
+    try expectError(" mov a, #cnt\ncnt set 2\n", "undefined symbol 'cnt'");
 }
 
 test "symbols may collide with directive names" {
